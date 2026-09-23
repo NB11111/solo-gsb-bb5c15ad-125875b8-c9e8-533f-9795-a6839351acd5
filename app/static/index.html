@@ -25,8 +25,12 @@
     </p>
     <div class="toolbar">
       <label class="btn btn-primary">
-        上传 CSV
+        上传 CSV（替换导入）
         <input type="file" id="file-input" accept=".csv,text/csv" hidden>
+      </label>
+      <label class="btn">
+        合并导入（预览差异）
+        <input type="file" id="merge-file-input" accept=".csv,text/csv" hidden>
       </label>
       <button id="btn-sample" class="btn">载入示例数据</button>
       <div class="scope-switch">
@@ -36,6 +40,12 @@
       </div>
       <span id="import-msg" class="msg"></span>
     </div>
+    <p class="hint" style="margin-bottom:0;">
+      「上传 CSV」为<b>替换导入</b>：整体替换当前会话的全部评分，并清空旧裁决与批处理规则；
+      「合并导入」会先按「选手 + 评委 + 项目」逐条比对，预览<b>新增、未变、分数变更、仅存在于当前会话</b>四类记录
+      （含新旧分数与将受影响的裁决），确认后才在同一事务落库；取消不改任何数据。
+    </p>
+    <div id="merge-preview"></div>
   </section>
 
   <!-- 空状态 -->

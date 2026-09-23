@@ -12,6 +12,14 @@ from pydantic import BaseModel, Field
 
 from . import database as db
 from .csv_io import CSVParseError, build_audit_csv, parse_scores
+from .merge import (
+    STATUS_LABELS as MERGE_STATUS_LABELS,
+    MergeValidationError,
+    basis_matches,
+    build_merge_plan,
+    current_basis,
+    normalize_incoming_records,
+)
 from .rules import (
     RuleValidationError,
     evaluate_rules,
@@ -21,6 +29,7 @@ from .rules import (
 from .scoring import (
     SCOPES,
     SCOPE_JUDGE,
+    SCOPE_LABELS,
     analyze,
     compare_contestants,
     stability_experiment,
@@ -87,6 +96,15 @@ class RuleBody(BaseModel):
 
 class RuleSetBody(BaseModel):
     rules: list[RuleBody] = Field(default_factory=list)
+
+
+class MergeConfirmBody(BaseModel):
+    # 客户端原样回传预览时解析出的记录与基线快照；
+    # 服务端重新校验并核对基线，避免「过期预览」覆盖新数据。
+    records: list[dict[str, Any]] = Field(min_length=1)
+    basis: list[dict[str, Any]] = Field(min_length=0)
+    # 仅在会话尚不存在（向空会话合并）时用于创建会话；已有会话保持原校准范围。
+    scope: Literal["judge", "judge_item"] | None = None
 
 
 def _normalize_session_rules(body: RuleSetBody, analysis: dict[str, Any]) -> list[dict[str, Any]]:
@@ -180,6 +198,95 @@ def load_sample(session_id: str, scope: str = SCOPE_JUDGE) -> dict[str, Any]:
         db.ensure_session(conn, session_id, scope)
         db.replace_scores(conn, session_id, records)
         return _build_analysis(conn, session_id, scope)
+
+
+@app.post("/api/sessions/{session_id}/merge/preview")
+async def merge_preview(
+    session_id: str,
+    file: UploadFile = File(...),
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """合并导入的只读预览：解析上传文件并与当前会话数据逐条比对。
+
+    按「选手+评委+项目」识别 新增/未变/分数变更/仅存在于当前会话 四类记录，
+    逐行给出新旧分数与受影响的旧裁决。不落库、不创建会话、不改变任何裁决。
+    """
+    raw = await file.read()
+    try:
+        records = parse_scores(raw)
+    except CSVParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    with db.get_conn() as conn:
+        stored_scope = db.get_scope(conn, session_id)
+        if scope is not None:
+            if scope not in SCOPES:
+                raise HTTPException(status_code=400, detail=f"不支持的校准范围: {scope}")
+            effective_scope = scope
+        else:
+            effective_scope = stored_scope or SCOPE_JUDGE
+        current = db.load_scores(conn, session_id)
+        decisions = db.load_decisions(conn, session_id)
+        plan = build_merge_plan(current, records, decisions)
+    return {
+        "scope": effective_scope,
+        "scope_label": SCOPE_LABELS[effective_scope],
+        "session_existed": stored_scope is not None,
+        "status_labels": MERGE_STATUS_LABELS,
+        "rows": plan["rows"],
+        "counts": plan["counts"],
+        "total_current": plan["total_current"],
+        "total_incoming": plan["total_incoming"],
+        "will_modify": plan["will_modify"],
+        "decisions_cleared": plan["decisions_cleared"],
+        "records": records,
+        "basis": current_basis(current),
+    }
+
+
+@app.post("/api/sessions/{session_id}/merge/confirm")
+def merge_confirm(session_id: str, body: MergeConfirmBody) -> dict[str, Any]:
+    """确认合并：在同一个数据库事务中落库预览结果。
+
+    分数变更/删除记录的旧裁决在事务内自动清除；未变记录及其裁决、已保存的
+    批处理规则均不触碰。若预览后会话数据被其他操作改动（基线不匹配），
+    返回 409 要求重新预览，绝不覆盖。
+    """
+    try:
+        records = normalize_incoming_records(body.records)
+    except MergeValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not all(
+        isinstance(item, dict)
+        and isinstance(item.get("contestant"), str)
+        and isinstance(item.get("judge"), str)
+        and isinstance(item.get("item"), str)
+        and isinstance(item.get("score"), (int, float))
+        and not isinstance(item.get("score"), bool)
+        for item in body.basis
+    ):
+        raise HTTPException(status_code=400, detail="basis 基线快照格式不正确，请重新预览。")
+    with db.get_conn() as conn:
+        current = db.load_scores(conn, session_id)
+        decisions = db.load_decisions(conn, session_id)
+        stored_scope = db.get_scope(conn, session_id)
+        if not basis_matches(body.basis, current):
+            raise HTTPException(
+                status_code=409,
+                detail="预览后当前会话数据已变化，请重新预览后再确认合并。",
+            )
+        plan = build_merge_plan(current, records, decisions)
+        # 全部变更随本事务一起提交；任何失败整体回滚。
+        if stored_scope is None:
+            db.ensure_session(conn, session_id, body.scope or SCOPE_JUDGE)
+        result = db.merge_scores(conn, session_id, plan["rows"])
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+    analysis["merge_applied"] = {
+        "counts": result["counts"],
+        "decisions_cleared": result["decisions_cleared"],
+        "rules_touched": 0,
+    }
+    return analysis
 
 
 @app.patch("/api/sessions/{session_id}/scores/{score_id}/decision")

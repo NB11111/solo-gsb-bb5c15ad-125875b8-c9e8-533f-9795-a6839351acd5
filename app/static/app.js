@@ -763,6 +763,7 @@ $("#btn-rule-apply").addEventListener("click", async () => {
     stability = null; // 裁决已变，稳定性实验结果作废
     rulePreviewData = null;
     rulePreviewStale = false;
+    clearMergePreview(); // 批量裁决改写后，预览中「旧裁决」信息已过期
     render();
     renderRulesPreview();
     setRulesMsg(
@@ -827,6 +828,7 @@ async function pushDecision(scoreId, useRaw, reason) {
     );
     stability = null; // 裁决变化会改变最终总分，实验结果作废
     rulePreviewData = null;
+    clearMergePreview(); // 裁决变化会使合并预览中的「旧裁决」信息过期
     render();
     renderRulesPreview();
     toast("排名已实时重算");
@@ -859,6 +861,191 @@ function onReasonInput(ev) {
     const s = currentState(scoreId);
     if (s) pushDecision(scoreId, s.use_raw, ev.target.value);
   }, 500));
+}
+
+// ---------- Merge import (preview then confirm) ----------
+let mergeData = null; // 最近一次合并预览结果（只读，不落库）
+let mergeFilter = "all";
+
+function clearMergePreview() {
+  mergeData = null;
+  mergeFilter = "all";
+  renderMergePreview();
+}
+
+function setMergeMsg(text, cls = "") {
+  const el = $("#merge-msg");
+  if (el) {
+    el.textContent = text;
+    el.className = "msg " + cls;
+  }
+}
+
+function decisionCell(row) {
+  if (row.status === "added") return `<span class="delta-flat">—（新记录，默认采用校准分）</span>`;
+  if (row.decision_action === "clear") {
+    const old = row.has_decision
+      ? (row.old_use_raw ? "保留原分" : "采用校准分") +
+        (row.old_reason ? `（${row.old_reason}）` : "")
+      : "";
+    return `<span class="delta-down">旧裁决将清除${old ? "：" + esc(old) : "（该记录本无裁决）"}</span>`;
+  }
+  if (row.decision_action === "keep") {
+    return `<span class="delta-up">裁决保留${row.old_reason ? "：" + esc(row.old_reason) : ""}</span>`;
+  }
+  return `<span class="delta-flat">—（无裁决，不受影响）</span>`;
+}
+
+function scorePairCell(row) {
+  const oldV = row.old_score === null ? '<span class="delta-flat">—</span>' : fmt(row.old_score);
+  const newV = row.new_score === null ? '<span class="delta-flat">—</span>' : fmt(row.new_score);
+  let arrow = "";
+  if (row.status === "changed") arrow = '<span class="mg-arrow">→</span>';
+  return `<td class="num">${oldV}</td><td class="num">${arrow}</td><td class="num"><b>${newV}</b></td>`;
+}
+
+function renderMergePreview() {
+  const panel = $("#merge-preview");
+  if (!panel) return;
+  if (!mergeData) {
+    panel.innerHTML = "";
+    return;
+  }
+  const p = mergeData;
+  const c = p.counts;
+  const filterDefs = [
+    ["all", "全部", p.rows.length],
+    ["changed", p.status_labels.changed, c.changed],
+    ["added", p.status_labels.added, c.added],
+    ["removed", p.status_labels.removed, c.removed],
+    ["unchanged", p.status_labels.unchanged, c.unchanged],
+  ];
+  const chips = filterDefs.map(([key, label, n]) =>
+    `<button type="button" class="chip ${mergeFilter === key ? "active" : ""}" data-filter="${key}">` +
+    `${esc(label)} <b>${n}</b></button>`).join("");
+
+  const visible = mergeFilter === "all" ? p.rows : p.rows.filter((r) => r.status === mergeFilter);
+  const rowsHtml = visible.map((r) => `
+    <tr class="mg-row ${r.status}">
+      <td><span class="mg-badge">${esc(p.status_labels[r.status])}</span></td>
+      <td>${esc(r.contestant)}</td><td>${esc(r.judge)}</td><td>${esc(r.item)}</td>
+      ${scorePairCell(r)}
+      <td>${decisionCell(r)}</td>
+    </tr>`).join("");
+
+  panel.innerHTML = `
+    <div class="merge-panel">
+      <div class="merge-banner">
+        合并预览（校准范围：<b>${esc(p.scope_label)}</b>，预览只读、未改任何数据）｜
+        当前会话 <b>${p.total_current}</b> 条 ← 合并文件 <b>${p.total_incoming}</b> 条：
+        <span class="mg-changed">分数变更 <b>${c.changed}</b></span>、
+        <span class="mg-added">新增 <b>${c.added}</b></span>、
+        <span class="mg-removed">仅当前会话/将删除 <b>${c.removed}</b></span>、
+        <span class="mg-unchanged">未变 <b>${c.unchanged}</b></span>。
+        确认后将改动 <b>${p.will_modify}</b> 条，并清除变更/删除记录上的旧裁决
+        <b class="delta-down">${p.decisions_cleared}</b> 条；
+        <b>未变记录及其裁决、已保存的批处理规则保持不动</b>。
+      </div>
+      <div class="merge-filters">${chips}</div>
+      <div class="table-wrap">
+        <table>
+          <tr><th>状态</th><th>选手</th><th>评委</th><th>项目</th>
+          <th class="num">旧分数</th><th></th><th class="num">新分数</th><th>受影响的裁决</th></tr>
+          ${rowsHtml || '<tr><td colspan="8" class="no-reversal">该分类下没有记录。</td></tr>'}
+        </table>
+      </div>
+      <div class="toolbar merge-actions">
+        <button id="btn-merge-confirm" class="btn btn-primary" ${p.will_modify === 0 ? "disabled" : ""}>
+          确认合并（同一事务应用 ${p.will_modify} 条变更）
+        </button>
+        <button id="btn-merge-cancel" class="btn btn-ghost-card">取消（不改数据）</button>
+        <span id="merge-msg" class="msg"></span>
+      </div>
+    </div>`;
+
+  panel.querySelectorAll(".chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      mergeFilter = chip.dataset.filter;
+      renderMergePreview();
+    });
+  });
+  $("#btn-merge-cancel").addEventListener("click", () => {
+    clearMergePreview();
+    setMsg("已取消合并，数据未做任何改动。", "ok");
+  });
+  $("#btn-merge-confirm").addEventListener("click", confirmMerge);
+}
+
+$("#merge-file-input").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  const scope = document.querySelector('input[name="scope"]:checked').value;
+  setMsg("正在解析并比对…");
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    mergeData = await api(
+      `/api/sessions/${SESSION_ID}/merge/preview?scope=${encodeURIComponent(scope)}`,
+      { method: "POST", body: fd },
+    );
+    mergeFilter = "all";
+    renderMergePreview();
+    const c = mergeData.counts;
+    setMsg(
+      `合并预览：新增 ${c.added}、变更 ${c.changed}、将删除 ${c.removed}、未变 ${c.unchanged}（尚未写入）`,
+      "ok",
+    );
+  } catch (err) {
+    mergeData = null;
+    renderMergePreview();
+    setMsg(err.message, "error");
+    toast("合并预览失败：" + err.message, true);
+  }
+});
+
+async function confirmMerge() {
+  const p = mergeData;
+  if (!p) return;
+  const c = p.counts;
+  if (
+    !confirm(
+      `确认应用合并导入？\n` +
+      `新增 ${c.added} 条，分数变更 ${c.changed} 条，删除仅存在于当前会话的 ${c.removed} 条，未变 ${c.unchanged} 条。\n` +
+      `将清除 ${p.decisions_cleared} 条旧裁决；未变记录与批处理规则保持不动。\n` +
+      `所有变更在同一事务中提交，失败则整体回滚；点「取消」不改任何数据。`,
+    )
+  ) return;
+  setMergeMsg("正在同一事务中应用合并…");
+  try {
+    const scope = document.querySelector('input[name="scope"]:checked').value;
+    analysis = await api(`/api/sessions/${SESSION_ID}/merge/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ records: p.records, basis: p.basis, scope }),
+    });
+    const applied = analysis.merge_applied.counts;
+    const cleared = analysis.merge_applied.decisions_cleared;
+    mergeData = null;
+    stability = null;
+    rulePreviewData = null;
+    render();
+    renderRulesPreview();
+    renderMergePreview();
+    setMsg(
+      `合并完成：新增 ${applied.added}、变更 ${applied.changed}、删除 ${applied.removed}、未变 ${applied.unchanged}，清除旧裁决 ${cleared} 条；批处理规则未改动。`,
+      "ok",
+    );
+    toast("合并导入完成，排名已刷新");
+  } catch (err) {
+    if (String(err.message).includes("重新预览")) {
+      mergeData = null;
+      renderMergePreview();
+    }
+    setMergeMsg(err.message, "error");
+    setMsg(err.message, "error");
+    toast("合并失败（未写入任何数据）：" + err.message, true);
+  }
 }
 
 // ---------- Data actions ----------
@@ -897,6 +1084,7 @@ $("#file-input").addEventListener("change", async (ev) => {
     stability = null;
     ruleDraft = null;
     rulePreviewData = null;
+    clearMergePreview(); // 替换导入后旧预览的基线已失效
     render();
     renderRulesPreview();
     setMsg(`已导入 ${analysis.counts.scores} 条评分`, "ok");
@@ -919,6 +1107,7 @@ $("#btn-sample").addEventListener("click", async () => {
     stability = null;
     ruleDraft = null;
     rulePreviewData = null;
+    clearMergePreview();
     render();
     renderRulesPreview();
     setMsg(`示例数据已载入（${analysis.counts.scores} 条评分）`, "ok");
@@ -940,6 +1129,11 @@ document.querySelectorAll('input[name="scope"]').forEach((radio) => {
       });
       stability = null; // 实验按校准范围重算，旧结果与新基线无关
       rulePreviewData = null; // 校准分依赖范围，区间命中结果需重新预览
+      if (mergeData) { // 合并预览的分数差异不受范围影响，仅刷新范围标签
+        mergeData.scope = analysis.scope;
+        mergeData.scope_label = analysis.scope_label;
+        renderMergePreview();
+      }
       render();
       renderRulesPreview();
       toast("校准范围已切换");
@@ -956,6 +1150,7 @@ $("#btn-reset-decisions").addEventListener("click", async () => {
     analysis = await api(`/api/sessions/${SESSION_ID}/decisions/reset`, { method: "POST" });
     stability = null;
     rulePreviewData = null;
+    clearMergePreview(); // 裁决被整体重置，预览中的旧裁决信息已过期
     render();
     renderRulesPreview();
     toast("已全部恢复为采用校准分");
@@ -976,6 +1171,7 @@ $("#btn-clear").addEventListener("click", async () => {
     stability = null;
     ruleDraft = null;
     rulePreviewData = null;
+    clearMergePreview();
     render();
     renderRulesPreview();
     setMsg("会话已清空。");

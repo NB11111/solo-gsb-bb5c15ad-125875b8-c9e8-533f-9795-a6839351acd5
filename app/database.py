@@ -121,6 +121,88 @@ def replace_scores(conn: sqlite3.Connection, session_id: str, records: Sequence[
     return len(records)
 
 
+def merge_scores(
+    conn: sqlite3.Connection,
+    session_id: str,
+    plan_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Apply a merge-import plan inside the caller's open transaction.
+
+    Plan rows use the status strings from app.merge:
+    - "changed":  原地 UPDATE 分数并删除该条旧裁决（行 id 保持不变）；
+    - "removed":  先删裁决再删评分（外键级联同样会删，显式删除以便计数）；
+    - "added":    按新文件顺序追加到 row_order 末尾；
+    - "unchanged": 完全不触碰。
+
+    批处理规则（batch_rules）与未变记录上的裁决均不修改。
+    返回各状态条数与实际清除的裁决数；任何一步失败由调用方的事务整体回滚。
+    """
+    counts = {"changed": 0, "added": 0, "removed": 0, "unchanged": 0}
+    decisions_cleared = 0
+    removed_ids: list[int] = []
+    added: list[Mapping[str, Any]] = []
+
+    for row in plan_rows:
+        status = row["status"]
+        counts[status] += 1
+        score_id = row.get("score_id")
+        if status == "changed":
+            cur = conn.execute(
+                "DELETE FROM decisions WHERE score_id = ? AND session_id = ?",
+                (score_id, session_id),
+            )
+            decisions_cleared += cur.rowcount
+            conn.execute(
+                "UPDATE scores SET score = ? WHERE id = ? AND session_id = ?",
+                (float(row["new_score"]), score_id, session_id),
+            )
+        elif status == "removed":
+            cur = conn.execute(
+                "DELETE FROM decisions WHERE score_id = ? AND session_id = ?",
+                (score_id, session_id),
+            )
+            decisions_cleared += cur.rowcount
+            removed_ids.append(score_id)
+        elif status == "added":
+            added.append(row)
+        # "unchanged": 不动。
+
+    if removed_ids:
+        conn.executemany(
+            "DELETE FROM scores WHERE id = ? AND session_id = ?",
+            [(sid, session_id) for sid in removed_ids],
+        )
+
+    if added:
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(row_order), -1) AS m FROM scores WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["m"]
+        added_sorted = sorted(
+            added, key=lambda r: r["incoming_order"] if r["incoming_order"] is not None else 0
+        )
+        conn.executemany(
+            "INSERT INTO scores(session_id, contestant, judge, item, score, row_order) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    session_id,
+                    r["contestant"],
+                    r["judge"],
+                    r["item"],
+                    float(r["new_score"]),
+                    max_row + 1 + idx,
+                )
+                for idx, r in enumerate(added_sorted)
+            ],
+        )
+
+    conn.execute(
+        "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?", (session_id,)
+    )
+    return {"counts": counts, "decisions_cleared": decisions_cleared}
+
+
 def load_scores(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT id, contestant, judge, item, score FROM scores "
