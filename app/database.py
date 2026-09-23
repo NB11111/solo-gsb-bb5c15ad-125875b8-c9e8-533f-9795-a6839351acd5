@@ -121,6 +121,86 @@ def replace_scores(conn: sqlite3.Connection, session_id: str, records: Sequence[
     return len(records)
 
 
+def merge_scores(
+    conn: sqlite3.Connection,
+    session_id: str,
+    diff_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Apply a merge-import diff in the caller's open transaction.
+
+    ``changed`` scores are updated in place (keeping their id); ``removed``
+    scores are deleted; ``added`` scores are inserted. Any adjudication on a
+    changed/removed score is deleted explicitly (rather than relying on the
+    cascade, so changed rows keep their id while losing their stale verdict).
+    ``unchanged`` rows are never touched, and ``batch_rules`` are left
+    completely alone. Returns the per-status write counts plus the number of
+    adjudications cleared.
+    """
+    added = changed = removed = unchanged = decisions_cleared = 0
+
+    clear_ids = [
+        r["score_id"]
+        for r in diff_rows
+        if r["status"] in ("changed", "removed") and r.get("decision_cleared")
+    ]
+    if clear_ids:
+        conn.executemany(
+            "DELETE FROM decisions WHERE score_id = ? AND session_id = ?",
+            [(sid, session_id) for sid in clear_ids],
+        )
+        decisions_cleared = len(clear_ids)
+
+    for r in diff_rows:
+        status = r["status"]
+        if status == "unchanged":
+            unchanged += 1
+        elif status == "changed":
+            cur = conn.execute(
+                "UPDATE scores SET score = ? WHERE id = ? AND session_id = ?",
+                (float(r["new_score"]), r["score_id"], session_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError(
+                    f"评分记录不存在或已被修改: id={r['score_id']}"
+                )
+            changed += 1
+        elif status == "removed":
+            cur = conn.execute(
+                "DELETE FROM scores WHERE id = ? AND session_id = ?",
+                (r["score_id"], session_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError(
+                    f"评分记录不存在或已被修改: id={r['score_id']}"
+                )
+            removed += 1
+
+    added_rows = [r for r in diff_rows if r["status"] == "added"]
+    if added_rows:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(row_order), -1) AS m FROM scores WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        next_order = row["m"] + 1
+        for r in added_rows:
+            conn.execute(
+                "INSERT INTO scores(session_id, contestant, judge, item, score, row_order) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (session_id, r["contestant"], r["judge"], r["item"], float(r["new_score"]), next_order),
+            )
+            next_order += 1
+            added += 1
+
+    conn.execute("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?", (session_id,))
+    return {
+        "added": added,
+        "unchanged": unchanged,
+        "changed": changed,
+        "removed": removed,
+        "decisions_cleared": decisions_cleared,
+    }
+
+
 def load_scores(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT id, contestant, judge, item, score FROM scores "

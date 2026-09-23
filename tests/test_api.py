@@ -426,5 +426,211 @@ class TestAPI(unittest.TestCase):
             self.assertEqual(c["a_leads"] + c["b_leads"] + c["ties"], 1)
 
 
+class TestMergeImport(unittest.TestCase):
+    SID = "merge-session"
+    BASE = (
+        "选手,评委,项目,分数\n"
+        "C1,JA,P1,8.30\nC2,JA,P1,8.00\n"          # two contestants, one item
+        "C1,JB,P1,8.30\nC2,JB,P1,7.75\n"
+    )
+    # C1/JA: 8.30 -> 9.00 (changed); C1/JB: 8.30 (unchanged);
+    # C2/JA stays in session but missing from file (removed);
+    # C2/JB: 7.75 -> 7.95 (changed); C3/JA: 6.50 (added).
+    MERGE = (
+        "选手,评委,项目,分数\n"
+        "C1,JA,P1,9.00\nC1,JB,P1,8.30\nC2,JB,P1,7.95\nC3,JA,P1,6.50\n"
+    )
+
+    def _scores_map(self):
+        data = client.get(f"/api/sessions/{self.SID}/analysis").json()
+        return {
+            (s["judge"], ib["item"], b["contestant"]): s
+            for b in data["contestants"]
+            for ib in b["items"]
+            for s in ib["scores"]
+        }, data
+
+    def test_01_preview_requires_session(self):
+        r = client.post(
+            f"/api/sessions/{self.SID}-new/merge/preview",
+            files={"file": ("m.csv", self.MERGE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("会话不存在", r.json()["detail"])
+
+    def test_02_preview_classifies_and_is_readonly(self):
+        r = client.post(
+            f"/api/sessions/{self.SID}/upload?scope=judge",
+            files={"file": ("b.csv", self.BASE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # Adjudicate C1/JA (the score that will change) and C2/JA (removed).
+        smap, _ = self._scores_map()
+        target_ids = [smap[("JA", "P1", "C1")]["id"], smap[("JA", "P1", "C2")]["id"]]
+        for sid in target_ids:
+            client.patch(
+                f"/api/sessions/{self.SID}/scores/{sid}/decision",
+                json={"use_raw": True, "reason": "复核"},
+            )
+
+        r = client.post(
+            f"/api/sessions/{self.SID}/merge/preview",
+            files={"file": ("m.csv", self.MERGE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        p = r.json()
+        self.assertEqual(p["counts"]["added"], 1)
+        self.assertEqual(p["counts"]["unchanged"], 1)
+        self.assertEqual(p["counts"]["changed"], 2)
+        self.assertEqual(p["counts"]["removed"], 1)
+        self.assertEqual(p["counts"]["decisions_cleared"], 2)
+        self.assertEqual(p["counts"]["total_existing"], 4)
+        self.assertEqual(p["counts"]["total_incoming"], 4)
+        self.assertEqual(p["counts"]["total_rows"], 5)
+        self.assertIn("added", p["status_labels"])
+        self.assertEqual(p["scope"], "judge")
+
+        rows = {(r["contestant"], r["judge"], r["item"]): r for r in p["rows"]}
+        changed = rows[("C1", "JA", "P1")]
+        self.assertEqual(changed["old_score"], 8.30)
+        self.assertEqual(changed["new_score"], 9.00)
+        self.assertTrue(changed["decision_cleared"])
+        self.assertTrue(changed["has_decision"])
+        same = rows[("C1", "JB", "P1")]
+        self.assertEqual(same["status"], "unchanged")
+        self.assertFalse(same["decision_cleared"])
+        gone = rows[("C2", "JA", "P1")]
+        self.assertEqual(gone["status"], "removed")
+        self.assertIsNone(gone["new_score"])
+        self.assertTrue(gone["decision_cleared"])
+        added = rows[("C3", "JA", "P1")]
+        self.assertEqual(added["status"], "added")
+        self.assertIsNone(added["old_score"])
+        self.assertFalse(added["has_decision"])
+
+        # Preview must not mutate anything.
+        again = client.get(f"/api/sessions/{self.SID}/analysis").json()
+        self.assertEqual(again["counts"]["scores"], 4)
+        self.assertEqual(again["counts"]["decisions"], 2)
+
+    def test_03_preview_bad_csv_is_400_and_readonly(self):
+        bad = "选手,评委,分数\nA,J,9".encode()
+        r = client.post(
+            f"/api/sessions/{self.SID}/merge/preview",
+            files={"file": ("bad.csv", bad, "text/csv")},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("项目", r.json()["detail"])
+        still = client.get(f"/api/sessions/{self.SID}/analysis").json()
+        self.assertEqual(still["counts"]["scores"], 4)
+
+    def test_04_apply_is_atomic_and_clears_stale_decisions(self):
+        # Persist a batch rule: merge must leave it intact.
+        rr = client.put(
+            f"/api/sessions/{self.SID}/rules",
+            json={"rules": [{"name": "保留规则", "use_raw": True, "priority": 5}]},
+        )
+        self.assertEqual(rr.status_code, 200)
+
+        r = client.post(
+            f"/api/sessions/{self.SID}/merge/apply",
+            files={"file": ("m.csv", self.MERGE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        applied = data["merge"]["applied"]
+        self.assertEqual(applied["added"], 1)
+        self.assertEqual(applied["unchanged"], 1)
+        self.assertEqual(applied["changed"], 2)
+        self.assertEqual(applied["removed"], 1)
+        self.assertEqual(applied["decisions_cleared"], 2)
+        self.assertEqual(data["counts"]["scores"], 4)
+        # Both adjudications were attached to changed/removed rows -> cleared.
+        self.assertEqual(data["counts"]["decisions"], 0)
+
+        smap, _ = self._scores_map()
+        # Changed row keeps its id and gets the new score.
+        c1ja = smap[("JA", "P1", "C1")]
+        self.assertEqual(c1ja["raw"], 9.00)
+        self.assertFalse(c1ja["use_raw"])
+        # Removed triple is gone; added triple exists.
+        self.assertNotIn(("JA", "P1", "C2"), smap)
+        self.assertEqual(smap[("JA", "P1", "C3")]["raw"], 6.50)
+        # Unchanged triple keeps its score.
+        self.assertEqual(smap[("JB", "P1", "C1")]["raw"], 8.30)
+
+        # Batch rules survive the merge untouched.
+        rules = client.get(f"/api/sessions/{self.SID}/rules").json()["rules"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["name"], "保留规则")
+
+    def test_05_unchanged_decisions_are_kept(self):
+        # Add an adjudication on the unchanged row, then re-merge the same file:
+        # it must survive both as a score and as a decision.
+        smap, _ = self._scores_map()
+        sid = smap[("JB", "P1", "C1")]["id"]
+        client.patch(
+            f"/api/sessions/{self.SID}/scores/{sid}/decision",
+            json={"use_raw": True, "reason": "未变记录"},
+        )
+        r = client.post(
+            f"/api/sessions/{self.SID}/merge/apply",
+            files={"file": ("m.csv", self.MERGE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        # Session already matches MERGE after test_04: every row is unchanged.
+        self.assertEqual(data["merge"]["applied"]["unchanged"], 4)
+        self.assertEqual(data["merge"]["applied"]["decisions_cleared"], 0)
+        self.assertEqual(data["counts"]["decisions"], 1)
+        smap2, _ = self._scores_map()
+        self.assertTrue(smap2[("JB", "P1", "C1")]["use_raw"])
+        self.assertEqual(smap2[("JB", "P1", "C1")]["reason"], "未变记录")
+
+    def test_06_apply_rolls_back_on_failure(self):
+        # A stale id in the diff (deleted between preview and apply) must abort
+        # the whole transaction: no insert/update/delete survives.
+        before = client.get(f"/api/sessions/{self.SID}/analysis").json()["counts"]
+        with db.get_conn() as conn:
+            rows = db.load_scores(conn, self.SID)
+            existing = [r for r in rows if (r["judge"], r["item"], r["contestant"]) == ("JB", "P1", "C1")]
+            stale_id = existing[0]["id"]
+            decisions = db.load_decisions(conn, self.SID)
+            from app.merge import build_merge_diff
+            records = [
+                {"contestant": "C1", "judge": "JB", "item": "P1", "score": 9.9},
+            ]
+            diff = build_merge_diff(rows, records, decisions)
+            # Sabotage the changed row's id so the UPDATE matches nothing.
+            for row in diff["rows"]:
+                if row["status"] == "changed":
+                    row["score_id"] = 999999
+            with self.assertRaises(db.NotFoundError):
+                db.merge_scores(conn, self.SID, diff["rows"])
+        after = client.get(f"/api/sessions/{self.SID}/analysis").json()["counts"]
+        self.assertEqual(after, before)
+
+    def test_07_bad_scope_rejected(self):
+        r = client.post(
+            f"/api/sessions/{self.SID}/merge/preview?scope=bogus",
+            files={"file": ("m.csv", self.MERGE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_08_merge_into_empty_session(self):
+        sid = "merge-empty-session"
+        client.delete(f"/api/sessions/{sid}")
+        r = client.post(
+            f"/api/sessions/{sid}/merge/apply?scope=judge_item",
+            files={"file": ("m.csv", self.MERGE.encode("utf-8-sig"), "text/csv")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["scope"], "judge_item")
+        self.assertEqual(data["merge"]["applied"]["added"], 4)
+        self.assertEqual(data["counts"]["scores"], 4)
+        client.delete(f"/api/sessions/{sid}")
+
+
 if __name__ == "__main__":
     unittest.main()

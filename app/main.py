@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import database as db
 from .csv_io import CSVParseError, build_audit_csv, parse_scores
+from .merge import STATUS_LABELS, build_merge_diff
 from .rules import (
     RuleValidationError,
     evaluate_rules,
@@ -21,6 +22,7 @@ from .rules import (
 from .scoring import (
     SCOPES,
     SCOPE_JUDGE,
+    SCOPE_LABELS,
     analyze,
     compare_contestants,
     stability_experiment,
@@ -154,15 +156,87 @@ async def upload_scores(
 ) -> dict[str, Any]:
     if scope not in SCOPES:
         raise HTTPException(status_code=400, detail=f"不支持的校准范围: {scope}")
-    raw = await file.read()
-    try:
-        records = parse_scores(raw)
-    except CSVParseError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    records = await _parse_upload(file)
     with db.get_conn() as conn:
         db.ensure_session(conn, session_id, scope)
         db.replace_scores(conn, session_id, records)
         return _build_analysis(conn, session_id, scope)
+
+
+async def _parse_upload(file: UploadFile) -> list[dict[str, Any]]:
+    raw = await file.read()
+    try:
+        return parse_scores(raw)
+    except CSVParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _merge_payload(
+    conn, session_id: str, records: list[dict[str, Any]], scope: str
+) -> dict[str, Any]:
+    existing = db.load_scores(conn, session_id)
+    decisions = db.load_decisions(conn, session_id)
+    diff = build_merge_diff(existing, records, decisions)
+    diff["scope"] = scope
+    diff["scope_label"] = SCOPE_LABELS[scope]
+    diff["status_labels"] = STATUS_LABELS
+    return diff
+
+
+@app.post("/api/sessions/{session_id}/merge/preview")
+async def merge_preview(
+    session_id: str,
+    file: UploadFile = File(...),
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Read-only merge-import dry run.
+
+    Classifies every incoming row (matched on 选手+评委+项目) as
+    added / unchanged / changed / removed and reports, per row, the old and
+    new scores and the adjudication that would be cleared. Nothing is
+    persisted: cancelling simply means not calling merge/apply.
+    """
+    records = await _parse_upload(file)
+    with db.get_conn() as conn:
+        stored_scope = db.get_scope(conn, session_id)
+        if stored_scope is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据（首次导入请使用「上传 CSV」）。")
+        effective_scope = _resolve_scope(conn, session_id, scope)
+        return _merge_payload(conn, session_id, records, effective_scope)
+
+
+@app.post("/api/sessions/{session_id}/merge/apply")
+async def merge_apply(
+    session_id: str,
+    file: UploadFile = File(...),
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Apply a merge import in a single transaction.
+
+    New rows are inserted, changed rows are updated in place, session-only
+    rows are deleted, and the old adjudication of every changed/deleted row
+    is removed. Unchanged rows and the session's batch rules are not touched.
+    Any failure rolls the whole merge back.
+    """
+    records = await _parse_upload(file)
+    with db.get_conn() as conn:
+        stored_scope = db.get_scope(conn, session_id)
+        if stored_scope is None:
+            # First import via merge is allowed: everything becomes "added".
+            if scope is not None and scope not in SCOPES:
+                raise HTTPException(status_code=400, detail=f"不支持的校准范围: {scope}")
+            effective_scope = scope or SCOPE_JUDGE
+            db.ensure_session(conn, session_id, effective_scope)
+        else:
+            if scope is not None and scope not in SCOPES:
+                raise HTTPException(status_code=400, detail=f"不支持的校准范围: {scope}")
+            effective_scope = scope or stored_scope
+        diff = _merge_payload(conn, session_id, records, effective_scope)
+        result = db.merge_scores(conn, session_id, diff["rows"])
+        analysis = _build_analysis(conn, session_id, effective_scope)
+    diff["applied"] = result
+    analysis["merge"] = diff
+    return analysis
 
 
 @app.post("/api/sessions/{session_id}/sample")

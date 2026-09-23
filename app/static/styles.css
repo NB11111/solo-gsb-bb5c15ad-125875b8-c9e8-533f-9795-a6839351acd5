@@ -365,3 +365,35 @@ tr.has-conflict td { background: #fff7f0; }
 tr.matched-row td { background: #f4faf6; }
 .assign-details { margin-top: 10px; }
 .assign-details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+
+/* ---------- Merge import preview ---------- */
+.merge-preview {
+  margin-top: 14px;
+  border-top: 1px dashed var(--line);
+  padding-top: 12px;
+}
+.merge-filter-bar { gap: 8px; margin-bottom: 10px; }
+.merge-filter b { margin-left: 4px; font-variant-numeric: tabular-nums; }
+.merge-filter-active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.merge-filter-active:hover { background: var(--primary-dark); border-color: var(--primary-dark); }
+.merge-badge {
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.merge-badge-added { background: #e7f7ee; color: var(--green); }
+.merge-badge-unchanged { background: #eef1f6; color: var(--muted); }
+.merge-badge-changed { background: #fff3e0; color: #b06a00; }
+.merge-badge-removed { background: #fdeaea; color: var(--red); }
+tr.merge-added td { background: #f3fbf6; }
+tr.merge-changed td { background: #fffaf0; }
+tr.merge-removed td { background: #fdf3f3; }
+tr.merge-removed:hover td { background: #fbecec; }
+.merge-table-wrap { max-height: 460px; overflow-y: auto; }
+.merge-table-wrap th { position: sticky; top: 0; z-index: 1; }
